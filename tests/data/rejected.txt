@@ -1,0 +1,3 @@
+The cloud platform MUST authenticate the provider.
+The credential MUST determine the cloud platform.
+The API call MUST be common.

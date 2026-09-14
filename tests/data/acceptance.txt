@@ -1,0 +1,7 @@
+The cloud platform MUST determine the specification template.
+All API calls MUST be authenticated by the provider.
+The credential SHOULD be stored.
+The cloud platform MUST NOT redirect the developer of the application.
+An account of the application MAY be configured.
+The provider SHOULD NOT store the credential.
+Every specification template MUST be common.

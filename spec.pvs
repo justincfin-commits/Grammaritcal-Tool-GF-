@@ -1,0 +1,415 @@
+%% spec.pvs -- the mathematical blueprint of gf-mltt.
+%%
+%% This file states, in PVS, the data and the properties that the Rust crate
+%% at ../src relies on. It was written without a PVS installation, so it has
+%% not been type checked or proved by PVS. The README says exactly that.
+%% The properties marked PROVED-IN-VERUS are the ones that ../verify checks
+%% mechanically for a model of the same algorithm. The properties marked
+%% STATED have a proof sketch in a comment and no machine proof anywhere.
+%%
+%% Theories, in dependency order:
+%%   newtypes        the wrapped primitives
+%%   term            the core terms with de Bruijn indices
+%%   debruijn        level and index arithmetic          PROVED-IN-VERUS
+%%   fuel_totality   why every recursive function stops PROVED-IN-VERUS
+%%   linearity       one slot per argument per field     PROVED-IN-VERUS
+%%   gaps            the missing phrase mechanism        PROVED-IN-VERUS (one_gapped_child)
+%%   earley          the nullable fixed point            PROVED-IN-VERUS (rounds_bound)
+%%   dcbor           the deterministic encoding          PROVED-IN-VERUS (head_round_trip)
+%%   determinism     analyze is a function
+
+%% -------------------------------------------------------------------------
+newtypes: THEORY
+BEGIN
+  %% Every primitive in the Rust crate is wrapped in a distinct type. Here the
+  %% names are uninterpreted and the counts are naturals.
+  CatName, FunName, VarName, FieldName, ParamValue, Token: TYPE+
+
+  Fuel: TYPE = nat
+  Depth: TYPE = nat
+  Level: TYPE = nat
+  Index: TYPE = nat
+  ArgIndex: TYPE = nat
+END newtypes
+
+%% -------------------------------------------------------------------------
+%% The core terms. Types and terms share one datatype, as in Martin-Lof type
+%% theory. A variable is a de Bruijn index counted from the nearest binder.
+term[CatName, FunName: TYPE]: DATATYPE
+BEGIN
+  var(index: nat): var?
+  cat(cat_name: CatName): cat?
+  fun(fun_name: FunName): fun?
+  univ(level: nat): univ?
+  pi(pi_dom: term, pi_cod: term): pi?
+  lam(lam_body: term): lam?
+  app(app_fun: term, app_arg: term): app?
+  sigma(sg_fst: term, sg_snd: term): sigma?
+  pair(pr_fst: term, pr_snd: term): pair?
+  fst(fst_arg: term): fst?
+  snd(snd_arg: term): snd?
+  id(id_ty: term, id_left: term, id_right: term): id?
+  refl(refl_ty: term, refl_point: term): refl?
+  j(j_level: nat, j_ty: term, j_left: term, j_motive: term,
+    j_base: term, j_right: term, j_proof: term): j?
+END term
+
+%% -------------------------------------------------------------------------
+debruijn: THEORY
+BEGIN
+  IMPORTING newtypes
+
+  %% Under `depth` binders the variable at level `l` has index depth-l-1,
+  %% and the variable at index `i` has level depth-i-1. quote_neutral in
+  %% src/mltt/eval.rs computes the first; fresh and bind compute the second.
+
+  level_to_index(depth: Depth, level: Level): lift[Index] =
+    IF level < depth THEN up(depth - level - 1) ELSE bottom ENDIF
+
+  index_to_level(depth: Depth, index: Index): lift[Level] =
+    IF index < depth THEN up(depth - index - 1) ELSE bottom ENDIF
+
+  %% PROVED-IN-VERUS: verify/src/debruijn.rs, level_to_index and index_to_level.
+  level_to_index_defined: LEMMA
+    FORALL (depth: Depth, level: Level):
+      up?(level_to_index(depth, level)) IFF level < depth
+
+  index_in_range: LEMMA
+    FORALL (depth: Depth, level: Level):
+      up?(level_to_index(depth, level)) IMPLIES down(level_to_index(depth, level)) < depth
+
+  %% PROVED-IN-VERUS: verify/src/debruijn.rs, lemma_round_trip.
+  round_trip: LEMMA
+    FORALL (depth: Depth, level: Level):
+      level < depth IMPLIES
+        index_to_level(depth, down(level_to_index(depth, level))) = up(level)
+
+  %% PROVED-IN-VERUS: verify/src/debruijn.rs, lemma_deeper_shifts_indices.
+  deeper_shifts: LEMMA
+    FORALL (depth: Depth, level: Level):
+      level < depth IMPLIES
+        down(level_to_index(depth + 1, level)) = down(level_to_index(depth, level)) + 1
+END debruijn
+
+%% -------------------------------------------------------------------------
+fuel_totality: THEORY
+BEGIN
+  IMPORTING newtypes
+
+  %% Every recursive function in the crate spends one unit of fuel per call
+  %% and returns a named error when the fuel is gone. That makes the fuel a
+  %% termination measure, so every such function is total.
+
+  spend(fuel: Fuel): lift[Fuel] =
+    IF fuel = 0 THEN bottom ELSE up(fuel - 1) ENDIF
+
+  %% PROVED-IN-VERUS: verify/src/fuel.rs, spend.
+  spend_decreases: LEMMA
+    FORALL (fuel: Fuel): up?(spend(fuel)) IMPLIES down(spend(fuel)) < fuel
+
+  spend_fails_only_at_zero: LEMMA
+    FORALL (fuel: Fuel): bottom?(spend(fuel)) IFF fuel = 0
+
+  %% A representative fuelled recursion. PVS generates a termination
+  %% condition from MEASURE fuel, and spend_decreases discharges it. The same
+  %% shape covers eval, quote, convertible, infer, check, eval_cexpr, and the
+  %% forest walker in the crate.
+  %% PROVED-IN-VERUS: verify/src/fuel.rs, walk.
+  walk(fuel: Fuel, work: nat): RECURSIVE nat =
+    IF work = 0 THEN 0
+    ELSE CASES spend(fuel) OF
+           bottom: 0,
+           up(left): walk(left, work - 1) + 1
+         ENDCASES
+    ENDIF
+    MEASURE fuel
+
+  walk_bounded: LEMMA
+    FORALL (fuel: Fuel, work: nat):
+      walk(fuel, work) <= fuel AND walk(fuel, work) <= work
+
+  walk_exact_with_enough_fuel: LEMMA
+    FORALL (fuel: Fuel, work: nat):
+      work <= fuel IMPLIES walk(fuel, work) = work
+END fuel_totality
+
+%% -------------------------------------------------------------------------
+linearity: THEORY
+BEGIN
+  IMPORTING newtypes
+
+  %% One output field of a rule is a list of items. An item is a word
+  %% (bottom) or a slot naming an argument (up(a)). The compiler accepts the
+  %% field exactly when every argument below the arity appears in exactly one
+  %% slot. That is what keeps the compiled grammar context free.
+
+  Item: TYPE = lift[ArgIndex]
+  Items: TYPE = list[Item]
+
+  count(items: Items, arg: ArgIndex): RECURSIVE nat =
+    CASES items OF
+      null: 0,
+      cons(head, tail):
+        (IF up?(head) AND down(head) = arg THEN 1 ELSE 0 ENDIF) + count(tail, arg)
+    ENDCASES
+    MEASURE length(items)
+
+  linear(items: Items, arity: nat): bool =
+    FORALL (a: below(arity)): count(items, a) = 1
+
+  %% The executable check in src/compile/productions.rs::check_linearity
+  %% returns true exactly when `linear` holds.
+  %% PROVED-IN-VERUS: verify/src/linearity.rs, check_linearity.
+
+  %% Under linearity, each argument stands at exactly one position, so the
+  %% tree rebuilder can place each child once and only once.
+  position_of(items: Items, arg: ArgIndex): RECURSIVE lift[nat] =
+    CASES items OF
+      null: bottom,
+      cons(head, tail):
+        IF up?(head) AND down(head) = arg THEN up(0)
+        ELSE CASES position_of(tail, arg) OF
+               bottom: bottom,
+               up(p): up(p + 1)
+             ENDCASES
+        ENDIF
+    ENDCASES
+    MEASURE length(items)
+
+  %% STATED. Proof: induction on items; count = 1 forces exactly one match.
+  linear_gives_unique_position: LEMMA
+    FORALL (items: Items, arity: nat, a: below(arity)):
+      linear(items, arity) IMPLIES
+        up?(position_of(items, a)) AND
+        nth(items, down(position_of(items, a))) = up(a) AND
+        (FORALL (p: below(length(items))):
+           nth(items, p) = up(a) IMPLIES p = down(position_of(items, a)))
+END linearity
+
+%% -------------------------------------------------------------------------
+gaps: THEORY
+BEGIN
+  IMPORTING newtypes
+
+  %% A production's children carry at most one missing phrase each. A child
+  %% is modeled as bottom (no gap) or up(g) (misses phrase g). Words cannot
+  %% host a gap and are left out of the model.
+  GapSpec: TYPE+
+  Child: TYPE = lift[GapSpec]
+  Production: TYPE = list[Child]
+
+  gapped(children: Production): RECURSIVE nat =
+    CASES children OF
+      null: 0,
+      cons(head, tail): (IF up?(head) THEN 1 ELSE 0 ENDIF) + gapped(tail)
+    ENDCASES
+    MEASURE length(children)
+
+  %% copy is base with gap g placed on child at, and nothing else changed.
+  is_copy_at(base, copy: Production, at: nat, g: GapSpec): bool =
+    length(copy) = length(base) AND at < length(base) AND
+    bottom?(nth(base, at)) AND nth(copy, at) = up(g) AND
+    (FORALL (j: below(length(base))): j /= at IMPLIES nth(copy, j) = nth(base, j))
+
+  %% The pass-down family: one copy per gap-free child.
+  pass_down(base: Production, g: GapSpec): set[Production] =
+    { copy: Production | EXISTS (at: below(length(base))): is_copy_at(base, copy, at, g) }
+
+  %% Every copy adds exactly one gap, and adds it to a child that had none.
+  %% PROVED-IN-VERUS: verify/src/gaps.rs, pass_down and lemma_copy_adds_one_gap.
+  one_gapped_child: LEMMA
+    FORALL (base, copy: Production, at: nat, g: GapSpec):
+      is_copy_at(base, copy, at, g) IMPLIES gapped(copy) = gapped(base) + 1
+
+  copy_targets_free_child: LEMMA
+    FORALL (base, copy: Production, at: nat, g: GapSpec):
+      is_copy_at(base, copy, at, g) IMPLIES bottom?(nth(base, at))
+
+  %% Why the bound variable is always index zero. A child carries a gap in
+  %% the base exactly when its argument is a function, which is exactly where
+  %% the rebuilder adds a lambda. A chain from a gapped left side down to the
+  %% gap site is a list of (production, position) steps, each step choosing
+  %% the child that carries the gap. Because every step's position is a child
+  %% that had no gap in the base, no step passes through a lambda.
+  Step: TYPE = [# base: Production, at: nat #]
+  Chain: TYPE = list[Step]
+
+  step_ok(s: Step): bool = s`at < length(s`base) AND bottom?(nth(s`base, s`at))
+
+  %% The number of lambdas between the binding lambda and the gap site is the
+  %% number of steps whose position is a function argument, which is the
+  %% number of steps whose base child carried a gap.
+  binders_between(chain: Chain): RECURSIVE nat =
+    CASES chain OF
+      null: 0,
+      cons(s, rest):
+        (IF s`at < length(s`base) AND up?(nth(s`base, s`at)) THEN 1 ELSE 0 ENDIF)
+        + binders_between(rest)
+    ENDCASES
+    MEASURE length(chain)
+
+  %% STATED. Proof: induction on the chain; step_ok makes every summand 0.
+  chain_has_no_binder: LEMMA
+    FORALL (chain: Chain):
+      every(step_ok)(chain) IMPLIES binders_between(chain) = 0
+END gaps
+
+%% -------------------------------------------------------------------------
+earley: THEORY
+BEGIN
+  IMPORTING newtypes
+
+  %% The nullable computation keeps one flag per nonterminal and repeats a
+  %% round that only turns flags on, until a round changes nothing. The crate
+  %% bounds the loop at n+1 rounds and reports NullableUnstable past it.
+
+  n: nat
+  Flags: TYPE = [below(n) -> bool]
+
+  on_count(f: Flags): nat = card({ i: below(n) | f(i) })
+
+  monotone(before, after: Flags): bool =
+    FORALL (i: below(n)): before(i) IMPLIES after(i)
+
+  changed(before, after: Flags): bool =
+    EXISTS (i: below(n)): NOT before(i) AND after(i)
+
+  on_count_bound: LEMMA FORALL (f: Flags): on_count(f) <= n
+
+  %% PROVED-IN-VERUS: verify/src/fixpoint.rs, lemma_change_raises_count.
+  change_raises_count: LEMMA
+    FORALL (before, after: Flags):
+      monotone(before, after) AND changed(before, after)
+        IMPLIES on_count(before) < on_count(after)
+
+  %% A run is a list of flag vectors, each round's output feeding the next.
+  Run: TYPE = list[Flags]
+
+  strict_run(run: Run): RECURSIVE bool =
+    CASES run OF
+      null: TRUE,
+      cons(first, rest):
+        CASES rest OF
+          null: TRUE,
+          cons(second, more):
+            monotone(first, second) AND changed(first, second) AND strict_run(rest)
+        ENDCASES
+    ENDCASES
+    MEASURE length(run)
+
+  %% At most n rounds can change something, so at most n+1 rounds run.
+  %% PROVED-IN-VERUS: verify/src/fixpoint.rs, compute_nullable.
+  rounds_bound: LEMMA
+    FORALL (run: Run): strict_run(run) IMPLIES length(run) <= n + 1
+
+  %% The Aycock and Horspool fix. Every insertion advances the dot over every
+  %% nullable nonterminal at once. Completeness claim: for every item
+  %% B -> alpha . A beta in column j and every derivation of tokens[j..k]
+  %% from A, the item B -> alpha A . beta is in column k. STATED. Proof: for
+  %% k > j the completer reads column j after it is frozen; for k = j the
+  %% symbol A is nullable and the insertion itself advanced the dot, so the
+  %% order in which items arrive never matters.
+END earley
+
+%% -------------------------------------------------------------------------
+dcbor: THEORY
+BEGIN
+  Byte: TYPE = below(256)
+  Bytes: TYPE = list[Byte]
+
+  %% The shortest head for a value takes 1, 2, 3, 5, or 9 bytes.
+  head_len(v: nat): nat =
+    IF v < 24 THEN 1
+    ELSIF v <= 255 THEN 2
+    ELSIF v <= 65535 THEN 3
+    ELSIF v <= 4294967295 THEN 5
+    ELSE 9 ENDIF
+
+  %% The value a big-endian byte list denotes.
+  be_value(bytes: Bytes): RECURSIVE nat =
+    CASES bytes OF
+      null: 0,
+      cons(head, tail): head * expt(256, length(tail)) + be_value(tail)
+    ENDCASES
+    MEASURE length(bytes)
+
+  %% The width bytes of a value, most significant first.
+  be_bytes(v: nat, width: nat): RECURSIVE Bytes =
+    IF width = 0 THEN null
+    ELSE append(be_bytes(div(v, 256), width - 1), cons(mod(v, 256), null))
+    ENDIF
+    MEASURE width
+
+  %% STATED in this form; PROVED-IN-VERUS: verify/src/dcbor.rs, be_bytes.
+  be_round_trip: LEMMA
+    FORALL (v: nat, width: nat):
+      v < expt(256, width) IMPLIES be_value(be_bytes(v, width)) = v
+
+  %% The head: one byte of major type and argument, then the value bytes.
+  put_head(major: below(8), v: nat): Bytes =
+    IF v < 24 THEN cons(major * 32 + v, null)
+    ELSIF v <= 255 THEN cons(major * 32 + 24, be_bytes(v, 1))
+    ELSIF v <= 65535 THEN cons(major * 32 + 25, be_bytes(v, 2))
+    ELSIF v <= 4294967295 THEN cons(major * 32 + 26, be_bytes(v, 4))
+    ELSE cons(major * 32 + 27, be_bytes(v, 8)) ENDIF
+
+  %% PROVED-IN-VERUS: verify/src/dcbor.rs, put_head.
+  head_shortest: LEMMA
+    FORALL (major: below(8), v: nat): length(put_head(major, v)) = head_len(v)
+
+  %% Reading the head back gives the major type and the value, which is what
+  %% makes the head injective on (major, value).
+  %% PROVED-IN-VERUS: verify/src/dcbor.rs, round_trip.
+  head_injective: LEMMA
+    FORALL (m1, m2: below(8), v1, v2: nat):
+      put_head(m1, v1) = put_head(m2, v2) IMPLIES m1 = m2 AND v1 = v2
+
+  %% Map keys are sorted by their encoded bytes, compared byte by byte.
+  lex_less(a, b: Bytes): RECURSIVE bool =
+    CASES a OF
+      null: NOT null?(b),
+      cons(x, xs):
+        CASES b OF
+          null: FALSE,
+          cons(y, ys): x < y OR (x = y AND lex_less(xs, ys))
+        ENDCASES
+    ENDCASES
+    MEASURE length(a)
+
+  sorted_unique(keys: list[Bytes]): RECURSIVE bool =
+    CASES keys OF
+      null: TRUE,
+      cons(k, rest):
+        CASES rest OF
+          null: TRUE,
+          cons(k2, more): lex_less(k, k2) AND sorted_unique(rest)
+        ENDCASES
+    ENDCASES
+    MEASURE length(keys)
+
+  %% STATED. Proof: lex_less is a strict total order, so a sorted list without
+  %% repeats is the unique enumeration of its set. This is what makes the
+  %% encoding of a map a function of the map's contents alone.
+  canonical_unique: LEMMA
+    FORALL (k1, k2: list[Bytes]):
+      sorted_unique(k1) AND sorted_unique(k2) AND
+      (FORALL (b: Bytes): member(b, k1) IFF member(b, k2))
+        IMPLIES k1 = k2
+END dcbor
+
+%% -------------------------------------------------------------------------
+determinism: THEORY
+BEGIN
+  %% analyze in src/analyze.rs takes a request and returns an outcome. It
+  %% reads no file, opens no socket, reads no clock, and draws no random
+  %% number. In PVS such a thing is a function, and a function applied twice
+  %% to one argument gives one result. The content of the claim is that the
+  %% Rust code has no other input; tests/purity.rs checks the source for the
+  %% forbidden ways of getting one, and tests/determinism.rs runs analyze
+  %% twice and compares the bytes.
+  Request, Outcome: TYPE+
+  analyze: [Request -> Outcome]
+
+  analyze_deterministic: LEMMA
+    FORALL (r: Request): analyze(r) = analyze(r)
+END determinism

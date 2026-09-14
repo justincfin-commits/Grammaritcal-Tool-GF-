@@ -1,0 +1,19 @@
+[package]
+name = "gf-mltt"
+version = "0.1.0"
+edition = "2021"
+description = "A Grammatical Framework tool whose abstract syntax is Martin-Lof type theory"
+publish = false
+
+[lib]
+name = "gf_mltt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gfmltt"
+path = "src/bin/gfmltt.rs"
+
+[dependencies]
+
+[profile.release]
+overflow-checks = true

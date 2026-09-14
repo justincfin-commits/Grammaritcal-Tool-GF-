@@ -1,0 +1,29 @@
+[package]
+name = "gf-mltt-verify"
+version = "0.1.0"
+edition = "2021"
+description = "Verus models of the core algorithms of gf-mltt, with machine checked proofs"
+publish = false
+
+# This crate is NOT a member of the main crate's build. The main crate stays
+# free of dependencies. Verify this crate with:
+#
+#   cd verify
+#   C:\Users\Home\verus\verus-x86-win\cargo-verus.exe verify
+#
+# Each module here is a model of one algorithm in ../src, written in the
+# subset of Rust that Verus verifies. The correspondence to ../src is by
+# inspection and by the shared test vectors, not by extraction.
+
+[lib]
+name = "gf_mltt_verify"
+path = "src/lib.rs"
+
+[dependencies]
+vstd = "=0.0.0-2026-06-14-0213"
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
